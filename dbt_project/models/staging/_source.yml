@@ -2,5 +2,7 @@ version: 2
 
 sources:
   - name: minio_datalake
+    database: minio_datalake
+    schema: silver
     tables:
       - name: accidentes_delta

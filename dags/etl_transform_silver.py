@@ -97,7 +97,7 @@ def clean_and_load_delta(**context):
         df['data'] = df['data'].dt.date
 
     # f. Metadatos
-    df['etl_fecha_ingesta'] = datetime.now()
+    df['etl_fecha_ingesta'] = pd.Timestamp.now(tz='UTC')
 
     # ==========================================
     # 3. CARGA (GUARDAR EN SILVER - DELTA)
@@ -119,7 +119,12 @@ def clean_and_load_delta(**context):
             table_or_uri=delta_table_path,
             data=tabla_arrow,
             mode="overwrite",
-            storage_options=STORAGE_OPTIONS_DELTA
+            storage_options=STORAGE_OPTIONS_DELTA,
+            configuration={
+                "delta.minReaderVersion": "2",
+                "delta.minWriterVersion": "2"
+            }
+
         )
         print(f"Carga en formato Delta finalizada exitosamente en: {delta_table_path}")
     except Exception as e:
