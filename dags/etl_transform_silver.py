@@ -149,7 +149,7 @@ with DAG(
 
     tarea_dbt = BashOperator(
         task_id='transformar_con_dbt',
-        bash_command='cd /opt/airflow/dbt_project && dbt run --profiles-dir .',
+        bash_command='cd /opt/airflow/dbt_project && dbt run --profiles-dir . --full-refresh',
     )
 
     tarea_delta >> tarea_dbt
