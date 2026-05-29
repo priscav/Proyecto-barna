@@ -19,7 +19,7 @@ from datetime import datetime
 # =========================
 # CONFIGURACIÓN
 # =========================
-INPUT_FILE = "data_cleaned.csv"
+INPUT_FILE = "../data_cleaned.csv"
 OUTPUT_FILE = "data_simulated.csv"
 
 N_NEW_ROWS = 50000
