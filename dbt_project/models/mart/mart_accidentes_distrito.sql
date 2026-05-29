@@ -1,3 +1,8 @@
+{{ config(
+    materialized='table',
+    datalake='minio_datalake',
+    schema='gold'
+) }}
 WITH accidentes AS (
     SELECT * FROM {{ ref('stg_accidentes') }}
 ),

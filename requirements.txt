@@ -6,3 +6,4 @@ psycopg2-binary
 mlflow
 scikit-learn
 apache-airflow-providers-postgres
+deltalake

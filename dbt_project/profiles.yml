@@ -7,5 +7,7 @@ proyecto_accidentes:
       port: 9047
       user: "dremio"
       password: "VRjRVpUEcnKyF7i"
+      schema: "gold"
       dremio_space: "data_barna"
+      object_storage_source: "minio_datalake"
       use_ssl: false

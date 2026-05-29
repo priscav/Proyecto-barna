@@ -5,19 +5,17 @@ import s3fs
 from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from deltalake.writer import write_deltalake
 from deltalake import DeltaTable
 
-# ==========================================
 # CONFIGURACIONES Y CONSTANTES GLOBALES
-# ==========================================
 MINIO_ENDPOINT = "http://minio:9000"
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER", "airflow")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD", "airflow")
 TARGET_BUCKET = "silver"
 
-# Configuraciones de conexión a S3 compartidas para leer y escribir Delta en MinIO
+# Configuracion de MinIO
 STORAGE_OPTIONS_DELTA = {
     "AWS_ACCESS_KEY_ID": ACCESS_KEY,
     "AWS_SECRET_ACCESS_KEY": SECRET_KEY,
@@ -27,17 +25,13 @@ STORAGE_OPTIONS_DELTA = {
     "AWS_S3_ALLOW_UNSAFE_RENAME": "true"
 }
 
-
 def clean_and_load_delta(**context):
-    # ==========================================
-    # 1. EXTRACCIÓN (LEER DESDE BRONZE - DELTA)
-    # ==========================================
+
+    # EXTRACCIÓN (LEER DESDE BRONZE - DELTA)
     bronze_file_path = context['dag_run'].conf.get('bronze_file_path')
 
-    # Si el DAG se ejecuta manualmente sin configuración, usamos la ruta por defecto
     if not bronze_file_path:
         ds = context['ds']
-        # Usamos el sufijo _delta que definimos en el DAG anterior
         bronze_file_path = f"s3://bronze/accidentes_raw_{ds}_delta"
         print(f"No se recibió conf manual. Usando ruta por defecto: {bronze_file_path}")
 
@@ -49,43 +43,43 @@ def clean_and_load_delta(**context):
     except Exception as e:
         raise ValueError(f"Error al leer la tabla Delta en MinIO ({bronze_file_path}). Detalles: {e}")
 
-    # ==========================================
     # 2. LÓGICA DE LIMPIEZA
-    # ==========================================
     print("2. Iniciando limpieza de datos...")
 
-    # a. Unificar la columna 'causa'
-    columnas_causa = ['Descripcio_causa_mediata', 'cause conductor', 'causa conductor', 'Descripcio_causa']
+    # Unificar la columna 'causa'
+    columnas_causa = ['descripcio_causa_mediata', 'cause conductor', 'causa conductor', 'descripcio_causa']
     cols_presentes = [col for col in columnas_causa if col in df.columns]
 
     if cols_presentes:
         df['causa'] = df[cols_presentes].bfill(axis=1).iloc[:, 0]
         df = df.drop(columns=cols_presentes)
 
-    # b. Limpieza general y de calidad
+    # Transformar valores nulos o vacíos en 'causa' a 'Altres'
+    if 'causa' in df.columns:
+        df['causa'] = df['causa'].fillna('Altres').astype(str).str.strip()
+        df['causa'] = df['causa'].replace(['', 'nan', 'None'], 'Altres')
+
+    # Limpieza general
     df = df.drop_duplicates()
 
-    if "Nom_districte" in df.columns:
-        df = df[df["Nom_districte"] != "Desconegut"]
+    if "nom_districte" in df.columns:
+        df = df[df["nom_districte"] != "Desconegut"]
 
-    if "Codi_districte" in df.columns:
-        df["Codi_districte"] = pd.to_numeric(df["Codi_districte"], errors='coerce')
-        df = df[df["Codi_districte"] != -1]
-        df = df.dropna(subset=["Codi_districte"])
+    if "codi_districte" in df.columns:
+        df["codi_districte"] = pd.to_numeric(df["codi_districte"], errors='coerce')
+        df = df[df["codi_districte"] != -1]
+        df = df.dropna(subset=["codi_districte"])
 
-    # c. Eliminación de nulos en columnas geográficas
-    geo_columns = ["Codi_districte", "Nom_districte", "Nom_barri", "Codi_barri"]
+    #Eliminación de nulos en columnas geográficas
+    geo_columns = ["codi_districte", "nom_districte", "nom_barri", "codi_barri"]
     for col in geo_columns:
         if col in df.columns:
             df = df.dropna(subset=[col])
 
-    if "Latitud_WGS84" in df.columns and "Longitud_WGS84" in df.columns:
-        df = df.dropna(subset=["Latitud_WGS84", "Longitud_WGS84"])
+    if "latitud_wgs84" in df.columns and "longitud_wgs84" in df.columns:
+        df = df.dropna(subset=["latitud_wgs84", "longitud_wgs84"])
 
-    # d. Normalización de cabeceras
-    df.columns = [str(col).strip().lower() for col in df.columns]
-    df = df.loc[:, ~df.columns.duplicated()]
-    # e. Poner fecha completa
+    #Poner fecha completa
     if set(['nk_any', 'mes_any', 'dia_mes']).issubset(df.columns):
         df['data'] = pd.to_datetime({
             'year': pd.to_numeric(df['nk_any'], errors='coerce'),
@@ -93,15 +87,15 @@ def clean_and_load_delta(**context):
             'day': pd.to_numeric(df['dia_mes'], errors='coerce')
         }, errors='coerce')
 
-        # Convertimos de Timestamp a Date puro (sin horas) para Power BI
         df['data'] = df['data'].dt.date
 
-    # f. Metadatos
+    #Metadatos
     df['etl_fecha_ingesta'] = pd.Timestamp.now(tz='UTC')
 
-    # ==========================================
-    # 3. CARGA (GUARDAR EN SILVER - DELTA)
-    # ==========================================
+    # CARGA (GUARDAR EN SILVER - DELTA)
+    print(f"Filas después de limpiar: {len(df)}")
+    print("Valores nulos restantes por columna:")
+    print(df.isnull().sum())
     print(f"3. Guardando tabla Delta limpia en el bucket '{TARGET_BUCKET}'...")
 
     # Asegurar que el bucket Silver existe en MinIO
@@ -112,29 +106,27 @@ def clean_and_load_delta(**context):
     delta_table_path = f"s3://{TARGET_BUCKET}/accidentes_delta"
 
     try:
-        # Convertimos el DataFrame limpio a una tabla PyArrow para resolver tipos de datos problemáticos
+        # Convertir a una tabla PyArrow
         tabla_arrow = pa.Table.from_pandas(df)
 
         write_deltalake(
             table_or_uri=delta_table_path,
             data=tabla_arrow,
             mode="overwrite",
+            schema_mode="overwrite",
             storage_options=STORAGE_OPTIONS_DELTA,
             configuration={
                 "delta.minReaderVersion": "2",
                 "delta.minWriterVersion": "2"
             }
-
         )
         print(f"Carga en formato Delta finalizada exitosamente en: {delta_table_path}")
     except Exception as e:
         print(f"Error guardando en Delta: {e}")
         raise e
 
-
-# =========================
 # DEFINICIÓN DEL DAG
-# =========================
+
 with DAG(
         dag_id='02_limpieza_y_carga_silver',
         schedule=None,
@@ -147,9 +139,10 @@ with DAG(
         python_callable=clean_and_load_delta,
     )
 
-    tarea_dbt = BashOperator(
-        task_id='transformar_con_dbt',
-        bash_command='cd /opt/airflow/dbt_project && dbt run --profiles-dir . --full-refresh',
+    trigger_gold = TriggerDagRunOperator(
+        task_id='trigger_capa_gold',
+        trigger_dag_id='03_transformacion_y_carga_gold',
+        wait_for_completion=False,
     )
 
-    tarea_delta >> tarea_dbt
+    tarea_delta >> trigger_gold

@@ -21,6 +21,8 @@ clean-targets:
 models:
   proyecto_accidentes:
     staging:
+      +schema: silver
       +materialized: view
     mart:
+      +schema: gold
       +materialized: table
