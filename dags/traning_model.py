@@ -1,13 +1,17 @@
 import os
 import pandas as pd
+import numpy as np
 import joblib
 import tempfile
 import mlflow
 import mlflow.sklearn
-from sklearn.preprocessing import LabelEncoder
+import pyarrow as pa
+import s3fs
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+from sklearn.model_selection import train_test_split
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import classification_report
-from sklearn.model_selection import ParameterGrid
+from sklearn.metrics import accuracy_score, f1_score
+from imblearn.over_sampling import SMOTE
 from deltalake import DeltaTable
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -16,15 +20,11 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# CONFIGURACIÓN (Rutas internas de Docker)
+# CONFIGURACIONES GLOBALES
 MINIO_ENDPOINT = "http://minio:9000"
 MLFLOW_TRACKING_URI = "http://mlflow:5000"
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER", "airflow")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD", "airflow")
-
-os.environ["AWS_ACCESS_KEY_ID"] = ACCESS_KEY
-os.environ["AWS_SECRET_ACCESS_KEY"] = SECRET_KEY
-os.environ["MLFLOW_S3_ENDPOINT_URL"] = MINIO_ENDPOINT
 
 STORAGE_OPTIONS_DELTA = {
     "AWS_ACCESS_KEY_ID": ACCESS_KEY,
@@ -34,33 +34,34 @@ STORAGE_OPTIONS_DELTA = {
     "AWS_ALLOW_HTTP": "true"
 }
 
-STORAGE_OPTIONS_PANDAS = {
-    "key": ACCESS_KEY,
-    "secret": SECRET_KEY,
-    "client_kwargs": {"endpoint_url": MINIO_ENDPOINT}
-}
+os.environ["AWS_ACCESS_KEY_ID"] = ACCESS_KEY
+os.environ["AWS_SECRET_ACCESS_KEY"] = SECRET_KEY
+os.environ["MLFLOW_S3_ENDPOINT_URL"] = MINIO_ENDPOINT
 
 RUTA_ACCIDENTES = "s3://silver/accidentes_delta"
 RUTA_METEO = "s3://silver/meteo_delta"
-RUTA_TRAFICO = "s3://silver/trafico_agregado_distrito.csv"
+RUTA_TRAFICO = "s3://silver/trafico_delta"
 
-def entrenar_modelo():
-    print("Cargando datos desde MinIO...")
+
+def entrenar_modelo_binario():
+    print("Cargando tablas Delta desde la capa Silver de MinIO...")
     df_accidentes = DeltaTable(RUTA_ACCIDENTES, storage_options=STORAGE_OPTIONS_DELTA).to_pandas()
     df_meteo = DeltaTable(RUTA_METEO, storage_options=STORAGE_OPTIONS_DELTA).to_pandas()
-    df_trafico = pd.read_csv(RUTA_TRAFICO, storage_options=STORAGE_OPTIONS_PANDAS)
+    df_trafico = DeltaTable(RUTA_TRAFICO, storage_options=STORAGE_OPTIONS_DELTA).to_pandas()
 
-    # Normalizar columnas a minúsculas
     df_accidentes.columns = df_accidentes.columns.str.lower()
     df_meteo.columns = df_meteo.columns.str.lower()
     df_trafico.columns = df_trafico.columns.str.lower()
 
-    df_trafico = df_trafico.rename(columns={"fecha": "data"})
+    # Correccion para asegurar que la columna temporal coincida en los cruces
+    if 'fecha' in df_trafico.columns:
+        df_trafico = df_trafico.rename(columns={'fecha': 'data'})
+
     df_accidentes["data"] = pd.to_datetime(df_accidentes["data"])
     df_meteo["data"] = pd.to_datetime(df_meteo["data"])
     df_trafico["data"] = pd.to_datetime(df_trafico["data"])
 
-    print("Cruzando datasets...")
+    print("Agregando y cruzando datasets de accidentes, meteo y trafico...")
     df_agg = (
         df_accidentes.groupby(["codi_districte", "nom_districte", "data", "descripcio_torn"])
         .agg(
@@ -78,86 +79,78 @@ def entrenar_modelo():
     media_por_turno = df_agg.groupby("descripcio_torn")["pct_congestion"].transform("mean")
     df_agg["pct_congestion"] = df_agg["pct_congestion"].fillna(media_por_turno)
 
-    p33 = df_agg["num_accidentes"].quantile(0.33)
-    p66 = df_agg["num_accidentes"].quantile(0.66)
+    print("Creando variable objetivo binaria basada en percentil 75...")
+    q75 = df_agg['num_accidentes'].quantile(0.75)
+    df_agg['hay_accidente'] = (df_agg['num_accidentes'] > q75).astype(int)
 
-    def clasificar_riesgo(n):
-        if n <= p33: return "bajo"
-        elif n <= p66: return "medio"
-        else: return "alto"
+    print("Codificando variables categoricas...")
+    le_turno = LabelEncoder()
+    le_dia = LabelEncoder()
+    df_agg['turno_enc'] = le_turno.fit_transform(df_agg['descripcio_torn'])
+    df_agg['dia_enc'] = le_dia.fit_transform(df_agg['dia_semana'])
 
-    df_agg["riesgo"] = df_agg["num_accidentes"].apply(clasificar_riesgo)
-
-    le_turno, le_dia, le_target = LabelEncoder(), LabelEncoder(), LabelEncoder()
-    df_agg["turno_enc"] = le_turno.fit_transform(df_agg["descripcio_torn"])
-    df_agg["dia_enc"] = le_dia.fit_transform(df_agg["dia_semana"])
-    df_agg["riesgo_enc"] = le_target.fit_transform(df_agg["riesgo"])
-
-    FEATURES = [
+    features = [
         "codi_districte", "turno_enc", "dia_enc", "mes", "dia_mes",
         "temperature_2m", "precipitation", "rain", "wind_speed_10m",
         "weather_code", "pct_congestion"
     ]
 
-    df_sorted = df_agg.sort_values("data")
-    split = int(len(df_sorted) * 0.8)
-    X_train, X_test = df_sorted[FEATURES].iloc[:split], df_sorted[FEATURES].iloc[split:]
-    y_train, y_test = df_sorted["riesgo_enc"].iloc[:split], df_sorted["riesgo_enc"].iloc[split:]
+    X = df_agg[features]
+    y = df_agg['hay_accidente']
 
-    print(" Configurando MLflow...")
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+    print("Aplicando escalado de caracteristicas con StandardScaler...")
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+
+    print("Aplicando SMOTE para balancear el conjunto de entrenamiento...")
+    smote = SMOTE(random_state=42, k_neighbors=5)
+    X_train_smote, y_train_smote = smote.fit_resample(X_train_scaled, y_train)
+
+    print("Configurando MLflow y entrenando el modelo Random Forest...")
     mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    mlflow.set_experiment("rf_accidentes_barcelona")
+    mlflow.set_experiment("rf_binario_accidentes")
 
-    param_grid = {
-        "n_estimators": [100, 200],
-        "max_depth": [10, 15],
-        "min_samples_leaf": [5],
-        "max_features": ["sqrt"]
-    }
+    with mlflow.start_run(run_name="RandomForest_Binario"):
+        rf_model = RandomForestClassifier(
+            n_estimators=300, max_depth=15, min_samples_split=5,
+            min_samples_leaf=2, random_state=42, n_jobs=-1, class_weight='balanced'
+        )
+        rf_model.fit(X_train_smote, y_train_smote)
 
-    mejor_f1, mejor_params, mejor_modelo = 0, None, None
+        y_pred = rf_model.predict(X_test_scaled)
+        acc = accuracy_score(y_test, y_pred)
+        f1 = f1_score(y_test, y_pred)
 
-    for params in ParameterGrid(param_grid):
-        with mlflow.start_run(nested=True):
-            modelo = RandomForestClassifier(**params, class_weight="balanced", random_state=42, n_jobs=-1)
-            modelo.fit(X_train, y_train)
-            y_pred = modelo.predict(X_test)
+        mlflow.log_metric("accuracy", acc)
+        mlflow.log_metric("f1_score", f1)
 
-            report = classification_report(y_test, y_pred, output_dict=True)
-            f1_macro = report["macro avg"]["f1-score"]
-            acc = report["accuracy"]
+        mlflow.sklearn.log_model(rf_model, artifact_path="modelo_rf", registered_model_name="RiesgoAccidentesBinario")
 
-            mlflow.log_params(params)
-            mlflow.log_metrics({"f1_macro": f1_macro, "accuracy": acc})
-
-            if f1_macro > mejor_f1:
-                mejor_f1, mejor_params, mejor_modelo = f1_macro, params, modelo
-
-    print(f"🏆 Mejor f1_macro: {mejor_f1:.3f}. Guardando modelo...")
-
-    with mlflow.start_run(run_name="Mejor_RandomForest"):
-        mlflow.log_params(mejor_params)
-        mlflow.log_metric("final_f1_macro", mejor_f1)
-        mlflow.sklearn.log_model(mejor_modelo, artifact_path="modelo_rf", registered_model_name="RiesgoAccidentesRF")
+        print("Guardando artefactos extra (Escalador y Encoders) en MinIO...")
+        fs = s3fs.S3FileSystem(key=ACCESS_KEY, secret=SECRET_KEY, client_kwargs={"endpoint_url": MINIO_ENDPOINT})
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            joblib.dump(le_target, os.path.join(tmpdir, "le_target.pkl"))
+            joblib.dump(scaler, os.path.join(tmpdir, "scaler_binario.pkl"))
             joblib.dump(le_turno, os.path.join(tmpdir, "le_turno.pkl"))
             joblib.dump(le_dia, os.path.join(tmpdir, "le_dia.pkl"))
-            mlflow.log_artifacts(tmpdir, artifact_path="artefactos_extra")
 
-    print(" Entrenamiento completado.")
+            for archivo in os.listdir(tmpdir):
+                fs.put(os.path.join(tmpdir, archivo), f"s3://silver/modelos/{archivo}")
 
-# DEFINICIÓN DEL DAG
+    print("Proceso de entrenamiento finalizado correctamente.")
+
+
 with DAG(
         dag_id='entrenamiento_modelo',
-        schedule='@monthly' ,
+        schedule=None,
         start_date=datetime(2024, 1, 1),
         catchup=False,
         tags=['mlflow', 'entrenamiento'],
 ) as dag:
-
-    task_tranning = PythonOperator(
-        task_id='entrenar_random_forest',
-        python_callable=entrenar_modelo,
+    task_entrenar = PythonOperator(
+        task_id='entrenar_random_forest_binario',
+        python_callable=entrenar_modelo_binario,
     )

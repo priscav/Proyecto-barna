@@ -7,3 +7,4 @@ mlflow
 scikit-learn
 apache-airflow-providers-postgres
 deltalake
+imbalanced-learn
