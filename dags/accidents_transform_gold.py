@@ -31,11 +31,11 @@ def update_or_create_bucket_gold():
 
 # DEFINICIÓN DEL DAG
 with DAG(
-        dag_id='03_transformacion_y_carga_gold',
+        dag_id='transformacion_carga_accidentes_gold',
         schedule=None,
         start_date=datetime(2024, 1, 1),
         catchup=False,
-        tags=['gold', 'dbt', 'dremio', 'minio'],
+        tags=['gold', 'dbt', 'dremio', 'minio', 'accidentes'],
 ) as dag:
 
     # TAREAS

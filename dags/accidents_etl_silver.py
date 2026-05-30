@@ -43,7 +43,7 @@ def clean_and_load_delta(**context):
     except Exception as e:
         raise ValueError(f"Error al leer la tabla Delta en MinIO ({bronze_file_path}). Detalles: {e}")
 
-    # 2. LÓGICA DE LIMPIEZA
+    # LIMPIEZA
     print("2. Iniciando limpieza de datos...")
 
     # Unificar la columna 'causa'
@@ -54,7 +54,6 @@ def clean_and_load_delta(**context):
         df['causa'] = df[cols_presentes].bfill(axis=1).iloc[:, 0]
         df = df.drop(columns=cols_presentes)
 
-    # Transformar valores nulos o vacíos en 'causa' a 'Altres'
     if 'causa' in df.columns:
         df['causa'] = df['causa'].fillna('Altres').astype(str).str.strip()
         df['causa'] = df['causa'].replace(['', 'nan', 'None'], 'Altres')
@@ -114,11 +113,7 @@ def clean_and_load_delta(**context):
             data=tabla_arrow,
             mode="overwrite",
             schema_mode="overwrite",
-            storage_options=STORAGE_OPTIONS_DELTA,
-            configuration={
-                "delta.minReaderVersion": "2",
-                "delta.minWriterVersion": "2"
-            }
+            storage_options=STORAGE_OPTIONS_DELTA
         )
         print(f"Carga en formato Delta finalizada exitosamente en: {delta_table_path}")
     except Exception as e:
@@ -126,23 +121,22 @@ def clean_and_load_delta(**context):
         raise e
 
 # DEFINICIÓN DEL DAG
-
 with DAG(
-        dag_id='02_limpieza_y_carga_silver',
+        dag_id='limpieza_accidentes_silver',
         schedule=None,
         start_date=datetime(2024, 1, 1),
         catchup=False,
-        tags=['silver', 'delta', 'minio'],
+        tags=['silver', 'delta', 'minio', 'accidentes'],
 ) as dag:
-    tarea_delta = PythonOperator(
+    task_delta = PythonOperator(
         task_id='clean_and_load_to_delta',
         python_callable=clean_and_load_delta,
     )
 
     trigger_gold = TriggerDagRunOperator(
         task_id='trigger_capa_gold',
-        trigger_dag_id='03_transformacion_y_carga_gold',
+        trigger_dag_id='transformacion_carga_accidentes_gold',
         wait_for_completion=False,
     )
 
-    tarea_delta >> trigger_gold
+    task_delta >> trigger_gold

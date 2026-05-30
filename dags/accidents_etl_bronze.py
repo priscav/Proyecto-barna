@@ -52,12 +52,11 @@ def extract_and_load_bronze(**context):
         print(f"Creando bucket '{BRONZE_BUCKET}'...")
         fs.mkdir(BRONZE_BUCKET)
 
-    # ==========================================
-    # 2. GUARDADO EN FORMATO DELTA
-    # ==========================================
+    # GUARDADO EN FORMATO DELTA
     ds = context['ds']
     delta_path = f"s3://{BRONZE_BUCKET}/accidentes_raw_{ds}_delta"
     df_raw = df_raw.fillna("")
+
     #quitar nombre columna duplicadas
     df_raw.columns = [str(col).strip().lower() for col in df_raw.columns]
     df_raw = df_raw.loc[:, ~df_raw.columns.duplicated()]
@@ -87,26 +86,23 @@ def extract_and_load_bronze(**context):
 
     return delta_path
 
-
-# =========================
 # DEFINICIÓN DEL DAG
-# =========================
 with DAG(
-        dag_id='01_ingesta_api_bronze',
+        dag_id='ingesta_accidentes_bronze',
         schedule='@daily',
         start_date=datetime(2024, 1, 1),
         catchup=False,
-        tags=['bronze', 'api', 'delta'],
+        tags=['bronze', 'delta' , 'accidentes'],
 ) as dag:
-    tarea_bronze = PythonOperator(
+    task_bronze = PythonOperator(
         task_id='fetch_api_to_bronze',
         python_callable=extract_and_load_bronze,
     )
 
-    disparar_silver = TriggerDagRunOperator(
+    trigger_silver = TriggerDagRunOperator(
         task_id="trigger_silver_cleaning",
-        trigger_dag_id="02_limpieza_y_carga_silver",
+        trigger_dag_id="limpieza_accidentes_silver",
         conf={"bronze_file_path": "{{ ti.xcom_pull(task_ids='fetch_api_to_bronze') }}"}
     )
 
-    tarea_bronze >> disparar_silver
+    task_bronze >> trigger_silver
